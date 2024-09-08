@@ -41,64 +41,7 @@ from vllm.worker.model_runner import (_BATCH_SIZES_TO_CAPTURE,
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-class SambaConfig(PretrainedConfig):
-
-    model_type = "phi3mamba"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-        self,
-        vocab_size=51200,
-        hidden_size=2560,
-        intermediate_size=9216,
-        num_hidden_layers=32,
-        num_attention_heads=40,
-        num_key_value_heads=4,
-        resid_pdrop=0.0,
-        embd_pdrop=0.0,
-        attention_dropout=0.0,
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        layer_norm_eps=1e-5,
-        use_cache=True,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        bos_token_id=1,
-        eos_token_id=2,
-        sliding_window=2047,
-        mb_per_layer= 2,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        self.num_key_value_heads = num_key_value_heads
-        self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.attention_dropout = attention_dropout
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.layer_norm_eps = layer_norm_eps
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.mb_per_layer = mb_per_layer
-        self.sliding_window = sliding_window
-
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
+# config: SambaConfig
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -122,7 +65,7 @@ class SambaMambaMixer(nn.Module):
     **selective** state spaces)
     """
 
-    def __init__(self, config: SambaConfig, layer_idx):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -191,13 +134,6 @@ class SambaMambaMixer(nn.Module):
         )
         self.activation = config.hidden_act
 
-        self.dt_layernorm = RMSNorm(self.time_step_rank,
-                                    eps=config.rms_norm_eps)
-        self.b_layernorm = RMSNorm(self.ssm_state_size,
-                                   eps=config.rms_norm_eps)
-        self.c_layernorm = RMSNorm(self.ssm_state_size,
-                                   eps=config.rms_norm_eps)
-
     def mamba_forward(self,
                       hidden_states: torch.Tensor,
                       cache_params: MambaCacheParams = None):
@@ -240,9 +176,9 @@ class SambaMambaMixer(nn.Module):
             [self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
             dim=-1,
         )
-        time_step = self.dt_layernorm(time_step.contiguous())
-        B = self.b_layernorm(B.contiguous())
-        C = self.c_layernorm(C.contiguous())
+        time_step = time_step.contiguous()
+        B = B.contiguous()
+        C = C.contiguous()
 
         discrete_time_step = self.dt_proj(time_step)[0].transpose(1, 2)
         # 3.c perform the recurrence y ← SSM(A, B, C)(x)
@@ -315,34 +251,29 @@ class SambaMLP(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=hidden_size,
-            output_sizes=[intermediate_size] * 2,
+        self.fc1 = MergedColumnParallelLinear(
+            input_size=config.hidden_size,
+            output_sizes=[config.intermediate_size] * 2,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = RowParallelLinear(input_size=intermediate_size,
-                                           output_size=hidden_size,
+            prefix=f"{prefix}.fc1")
+        self.fc2 = RowParallelLinear(input_size=config.intermediate_size,
+                                           output_size=config.hidden_size,
                                            bias=bias,
                                            quant_config=quant_config,
-                                           prefix=f"{prefix}.down_proj")
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+                                           prefix=f"{prefix}.fc2")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.fc1(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.fc2(x)
         return x
 
 
@@ -351,20 +282,20 @@ class SambaMLP(nn.Module):
 class SambaMambaDecoderLayer(nn.Module):
 
     def __init__(self,
-                 config: SambaConfig,
+                 config: PretrainedConfig,
                  layer_idx: int,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
-        self.mamba = SambaMambaMixer(config, layer_idx)
+        self.attn = SambaMambaMixer(config, layer_idx)
         ffn_layer_class = SambaMLP
-        self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
+        self.mlp= ffn_layer_class(config, quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(config.hidden_size,
-                                        eps=config.rms_norm_eps)
+                                       eps=config.layer_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                        eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -382,20 +313,20 @@ class SambaMambaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.mamba(hidden_states, attn_metadata, conv_state,
+        hidden_states = self.attn(hidden_states, attn_metadata, conv_state,
                                    ssm_state)
         # Fully Connected
-        hidden_states, residual = self.pre_ff_layernorm(
+        hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
-class SambaAttentionDecoderLayer(nn.Module):
-
+class SambaAttention(nn.Module):
+    
     def __init__(
         self,
-        config: SambaConfig,
+        config: PretrainedConfig,
         layer_idx: int,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -421,7 +352,7 @@ class SambaAttentionDecoderLayer(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
+        self.Wqkv = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -429,7 +360,7 @@ class SambaAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
+        self.out_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
                                         config.hidden_size,
                                         bias=False,
                                         quant_config=quant_config)
@@ -441,14 +372,8 @@ class SambaAttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
         )
-        ffn_layer_class = SambaMLP
-        self.feed_forward = ffn_layer_class(config, quant_config=quant_config)
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(config.hidden_size,
-                                        eps=config.rms_norm_eps)
 
-    def self_attention(
+    def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -456,11 +381,35 @@ class SambaAttentionDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.Wqkv(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.out_proj(attn_output)
         return output
+       
+    
+class SambaAttentionDecoderLayer(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_idx: int,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ) -> None:
+        super().__init__()
+        self.attn = SambaAttention(
+            config,
+            layer_idx,
+            cache_config,
+            quant_config,
+        )
+        ffn_layer_class = SambaMLP
+        self.mlp = ffn_layer_class(config, quant_config=quant_config)
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.layer_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                        eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -478,16 +427,16 @@ class SambaAttentionDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
 
-        hidden_states = self.self_attention(
+        hidden_states = self.attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
         # Fully Connected
-        hidden_states, residual = self.pre_ff_layernorm(
+        hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.feed_forward(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -501,7 +450,7 @@ class SambaModel(nn.Module):
 
     def __init__(
         self,
-        config: SambaConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
@@ -530,7 +479,7 @@ class SambaModel(nn.Module):
                             quant_config=quant_config))
         self.layers = nn.ModuleList(decoder_layers)
         self.final_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
+                                       eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -550,12 +499,9 @@ class SambaModel(nn.Module):
             current_ssm_state = None
             current_conv_state = None
             if isinstance(layer, SambaAttentionDecoderLayer):
-                kv_cache = kv_caches[(i - self.config.attn_layer_offset) //
-                                     self.config.attn_layer_period]
+                kv_cache = kv_caches[(i - 1) // 2]
             if isinstance(layer, SambaMambaDecoderLayer):
-                current_state_layer = i - (1 +
-                                           (i - self.config.attn_layer_offset)
-                                           // self.config.attn_layer_period)
+                current_state_layer = i // 2
                 current_ssm_state = ssm_state[current_state_layer]
                 current_conv_state = conv_state[current_state_layer]
 
@@ -574,7 +520,7 @@ class SambaModel(nn.Module):
 
 class SambaForCausalLM(nn.Module, HasInnerState):
     packed_modules_mapping = {
-        "qkv_proj": [
+        "Wqkv": [
             "q_proj",
             "k_proj",
             "v_proj",
@@ -583,8 +529,8 @@ class SambaForCausalLM(nn.Module, HasInnerState):
 
     # LoRA specific attributes
     supported_lora_modules = [
-        "qkv_proj",
-        "o_proj",
+        "Wqkv",
+        "out_proj",
         "embed_tokens",
         "lm_head",
     ]
@@ -596,7 +542,7 @@ class SambaForCausalLM(nn.Module, HasInnerState):
 
     def __init__(
         self,
-        config: SambaConfig,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
