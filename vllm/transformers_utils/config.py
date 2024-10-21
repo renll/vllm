@@ -1,10 +1,11 @@
-import contextlib
 import enum
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
 
-from huggingface_hub import file_exists, hf_hub_download
+import huggingface_hub
+from huggingface_hub import (file_exists, hf_hub_download,
+                             try_to_load_from_cache)
 from transformers import GenerationConfig, PretrainedConfig
 from transformers.models.auto.image_processing_auto import (
     get_image_processor_config)
@@ -18,10 +19,11 @@ from vllm.logger import init_logger
 # yapf: disable
 from vllm.transformers_utils.configs import (ChatGLMConfig, DbrxConfig,
                                              EAGLEConfig, ExaoneConfig,
-                                             GraniteConfig, InternVLChatConfig,
-                                             JAISConfig, MedusaConfig,
+                                             InternVLChatConfig, JAISConfig,
+                                             MedusaConfig, MllamaConfig,
                                              MLPSpeculatorConfig, MPTConfig,
-                                             NemotronConfig, RWConfig,
+                                             NemotronConfig, NVLM_D_Config,
+                                             RWConfig, SolarConfig,
                                              UltravoxConfig)
 # yapf: enable
 from vllm.transformers_utils.utils import check_gguf_file
@@ -34,6 +36,10 @@ else:
 MISTRAL_CONFIG_NAME = "params.json"
 
 logger = init_logger(__name__)
+
+_CONFIG_REGISTRY_OVERRIDE_HF: Dict[str, Type[PretrainedConfig]] = {
+    "mllama": MllamaConfig
+}
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     "chatglm": ChatGLMConfig,
@@ -48,15 +54,11 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     "exaone": ExaoneConfig,
     "internvl_chat": InternVLChatConfig,
     "nemotron": NemotronConfig,
+    "NVLM_D": NVLM_D_Config,
+    "solar": SolarConfig,
     "ultravox": UltravoxConfig,
-    # Granite can be removed from here once we have upgraded to
-    # transformers 4.45+
-    "granite": GraniteConfig,
+    **_CONFIG_REGISTRY_OVERRIDE_HF
 }
-
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
 
 
 class ConfigFormat(str, enum.Enum):
@@ -70,7 +72,59 @@ def file_or_path_exists(model: Union[str, Path], config_name, revision,
     if Path(model).exists():
         return (Path(model) / config_name).is_file()
 
-    return file_exists(model, HF_CONFIG_NAME, revision=revision, token=token)
+    # Offline mode support: Check if config file is cached already
+    cached_filepath = try_to_load_from_cache(repo_id=model,
+                                             filename=config_name,
+                                             revision=revision)
+    if isinstance(cached_filepath, str):
+        # The config file exists in cache- we can continue trying to load
+        return True
+
+    # NB: file_exists will only check for the existence of the config file on
+    # hf_hub. This will fail in offline mode.
+    try:
+        return file_exists(model, config_name, revision=revision, token=token)
+    except huggingface_hub.errors.OfflineModeIsEnabled:
+        # Don't raise in offline mode, all we know is that we don't have this
+        # file cached.
+        return False
+
+
+def patch_rope_scaling(config: PretrainedConfig) -> None:
+    """Provide backwards compatibility for RoPE."""
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        patch_rope_scaling(text_config)
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is not None:
+        patch_rope_scaling_dict(rope_scaling)
+
+
+def patch_rope_scaling_dict(rope_scaling: Dict[str, Any]) -> None:
+    if "rope_type" not in rope_scaling and "type" in rope_scaling:
+        rope_scaling["rope_type"] = rope_scaling["type"]
+        logger.info("Replacing legacy 'type' key with 'rope_type'")
+
+    if "rope_type" not in rope_scaling:
+        raise ValueError("rope_scaling should have a 'rope_type' key")
+
+    if rope_scaling["rope_type"] == "su":
+        rope_scaling["rope_type"] = "longrope"
+        logger.warning("Replacing legacy rope_type 'su' with 'longrope'")
+    elif rope_scaling["rope_type"] == "mrope":
+        assert "mrope_section" in rope_scaling
+        rope_scaling["rope_type"] = "default"
+        logger.warning("Replacing legacy rope_type 'mrope' with 'default'")
+
+
+def uses_mrope(config: PretrainedConfig) -> bool:
+    """Detect if the model with this config uses M-ROPE."""
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return False
+
+    return "mrope_section" in rope_scaling
 
 
 def get_config(
@@ -102,6 +156,15 @@ def get_config(
                                  token=kwargs.get("token")):
             config_format = ConfigFormat.MISTRAL
         else:
+            # If we're in offline mode and found no valid config format, then
+            # raise an offline mode error to indicate to the user that they
+            # don't have files cached and may need to go online.
+            # This is conveniently triggered by calling file_exists().
+            file_exists(model,
+                        HF_CONFIG_NAME,
+                        revision=revision,
+                        token=kwargs.get("token"))
+
             raise ValueError(f"No supported config format found in {model}")
 
     if config_format == ConfigFormat.HF:
@@ -164,6 +227,8 @@ def get_config(
             )
             config.update({key: value})
 
+    patch_rope_scaling(config)
+
     return config
 
 
@@ -205,14 +270,27 @@ def load_params_config(model, revision) -> PretrainedConfig:
     config_dict["hidden_act"] = config_dict.get("activation", "silu")
     config_dict["tie_word_embeddings"] = config_dict.get(
         "tie_embeddings", False)
+    config_dict["max_seq_len"] = config_dict.get("max_seq_len", 128_000)
+    config_dict["max_position_embeddings"] = config_dict.get(
+        "max_position_embeddings", 128_000)
 
-    if config_dict["model_type"] == "transformer":
-        if "moe" in config_dict:
-            config_dict["architectures"] = ["MixtralForCausalLM"]
-        else:
-            config_dict["architectures"] = ["MistralForCausalLM"]
+    if config_dict.get("moe") is not None:
+        config_dict["architectures"] = ["MixtralForCausalLM"]
+    else:
+        config_dict["architectures"] = ["MistralForCausalLM"]
 
-    return recurse_elems(config_dict)
+    if config_dict.get("vision_encoder") is not None:
+        multimodal_config = config_dict.pop("vision_encoder")
+
+        config_dict = {
+            "text_config": config_dict,
+            "vision_config": multimodal_config
+        }
+        config_dict["architectures"] = ["PixtralForConditionalGeneration"]
+        config_dict["model_type"] = "pixtral"
+
+    config = recurse_elems(config_dict)
+    return config
 
 
 def get_hf_image_processor_config(
